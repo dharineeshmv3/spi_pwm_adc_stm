@@ -1,0 +1,477 @@
+/**
+ ******************************************************************************
+ * @file    master.c
+ * @brief   Board 1 - SPI1 Master + ADC1 + USART2 Debug Output
+ *
+ *          Reads potentiometer via ADC1 on PA0
+ *          Scales 12-bit ADC (0-4095) to 8-bit (0-255)
+ *          Sends value to Slave via SPI1 every 10 ms
+ *          Prints ADC and duty-cycle values through USART2
+ *
+ * Connections:
+ *
+ * Potentiometer:
+ *   PA0  -> Potentiometer middle pin
+ *   3.3V -> One end of potentiometer
+ *   GND  -> Other end of potentiometer
+ *
+ * SPI to Slave:
+ *   PA4  -> Slave PA4 (SS)
+ *   PA5  -> Slave PA5 (SCK)
+ *   PA7  -> Slave PA7 (MOSI)
+ *   GND  -> Slave GND
+ *
+ * USART2:
+ *   PA2 -> USART2_TX -> ST-LINK Virtual COM Port -> PC
+ *   PA3 -> USART2_RX
+ *
+ * SPI:
+ *   Master mode
+ *   Mode 0
+ *   8-bit
+ *   MSB first
+ *   Baud ~= 1 MHz (16 MHz PCLK2 / 16)
+ *
+ * ADC:
+ *   ADC1 Channel 0
+ *   PA0
+ *   12-bit
+ *   Software triggered
+ *
+ * NUCLEO-F401RE | 16 MHz HSI clock
+ ******************************************************************************
+ */
+
+#include "stm32f4xx.h"
+#include <stdint.h>
+
+/* Function prototypes */
+void SPI1_init(void);
+void SPI1_write(uint8_t data);
+
+void ADC1_init(void);
+uint16_t ADC1_read(void);
+
+void USART2_init(void);
+void USART2_write_char(char ch);
+void USART2_write_string(const char *str);
+void USART2_write_uint(uint32_t num);
+
+void delayMs(int n);
+
+
+/* ============================================================================
+ * MAIN
+ * ========================================================================== */
+
+int main(void)
+{
+    uint16_t adc_val;
+    uint8_t duty;
+
+    /* Initialize peripherals */
+    ADC1_init();
+    SPI1_init();
+    USART2_init();
+
+    /* Startup message */
+    USART2_write_string("\r\n");
+    USART2_write_string("====================================\r\n");
+    USART2_write_string(" STM32 SPI MASTER STARTED\r\n");
+    USART2_write_string(" ADC + SPI + USART2\r\n");
+    USART2_write_string("====================================\r\n");
+
+    while (1)
+    {
+        /* ---------------------------------------------------------------
+         * STEP 1: Read potentiometer
+         * ------------------------------------------------------------- */
+        adc_val = ADC1_read();
+
+        /* ---------------------------------------------------------------
+         * STEP 2: Convert 12-bit ADC value to 8-bit duty
+         *
+         * 0     -> 0
+         * 1024  -> 64
+         * 2048  -> 128
+         * 3072  -> 192
+         * 4095  -> 255
+         * ------------------------------------------------------------- */
+        duty = (uint8_t)(adc_val >> 4);
+
+        /* ---------------------------------------------------------------
+         * STEP 3: Pull SS LOW
+         * ------------------------------------------------------------- */
+        GPIOA->BSRR = 0x00100000;      /* BR4 -> PA4 LOW */
+
+        /* ---------------------------------------------------------------
+         * STEP 4: Send duty cycle to SPI slave
+         * ------------------------------------------------------------- */
+        SPI1_write(duty);
+
+        /* ---------------------------------------------------------------
+         * STEP 5: Pull SS HIGH
+         * ------------------------------------------------------------- */
+        GPIOA->BSRR = 0x00000010;      /* BS4 -> PA4 HIGH */
+
+        /* ---------------------------------------------------------------
+         * STEP 6: Display values on serial terminal
+         *
+         * Example:
+         * ADC = 2048   Duty = 128
+         * ------------------------------------------------------------- */
+        USART2_write_string("ADC = ");
+        USART2_write_uint(adc_val);
+
+        USART2_write_string("   Duty = ");
+        USART2_write_uint(duty);
+
+        USART2_write_string("\r\n");
+
+        /* ---------------------------------------------------------------
+         * STEP 7: Wait 10 ms
+         * ------------------------------------------------------------- */
+        delayMs(10);
+    }
+}
+
+
+/* ============================================================================
+ * SPI1 MASTER INITIALIZATION
+ * ============================================================================
+ *
+ * PA4 = Software SS
+ * PA5 = SPI1_SCK
+ * PA7 = SPI1_MOSI
+ *
+ * Mode 0:
+ * CPOL = 0
+ * CPHA = 0
+ *
+ * Master
+ * MSB first
+ *
+ * Baud rate:
+ * 16 MHz / 16 = 1 MHz
+ * ========================================================================== */
+
+void SPI1_init(void)
+{
+    /* Enable GPIOA clock */
+    RCC->AHB1ENR |= 0x00000001;
+
+    /* Enable SPI1 clock */
+    RCC->APB2ENR |= 0x00001000;
+
+    /* -----------------------------------------------------------------------
+     * PA5 and PA7 -> Alternate Function mode
+     * PA5 = SPI1_SCK
+     * PA7 = SPI1_MOSI
+     * --------------------------------------------------------------------- */
+
+    GPIOA->MODER &= ~0x0000CC00;
+    GPIOA->MODER |=  0x00008800;
+
+    /* AF5 = SPI1 */
+    GPIOA->AFR[0] &= ~0xF0F00000;
+    GPIOA->AFR[0] |=  0x50500000;
+
+    /* -----------------------------------------------------------------------
+     * PA4 -> Output
+     * Used as software-controlled Slave Select
+     * --------------------------------------------------------------------- */
+
+    GPIOA->MODER &= ~0x00000300;
+    GPIOA->MODER |=  0x00000100;
+
+    /* SS idle HIGH */
+    GPIOA->BSRR = 0x00000010;
+
+    /* -----------------------------------------------------------------------
+     * SPI1 CR1
+     *
+     * SSM  = 1  -> Software slave management
+     * SSI  = 1  -> Internal NSS high
+     * MSTR = 1  -> Master
+     * BR   = 011 -> fPCLK2 / 16
+     * CPOL = 0
+     * CPHA = 0
+     * LSBFIRST = 0
+     * --------------------------------------------------------------------- */
+
+    SPI1->CR1 = 0x031C;
+
+    /* No special CR2 configuration */
+    SPI1->CR2 = 0;
+
+    /* Enable SPI */
+    SPI1->CR1 |= 0x0040;
+}
+
+
+/* ============================================================================
+ * SPI1 WRITE
+ * ============================================================================
+ *
+ * Sends one byte to the slave.
+ * ========================================================================== */
+
+void SPI1_write(uint8_t data)
+{
+    /* Wait until transmit buffer is empty */
+    while (!(SPI1->SR & 0x0002))
+    {
+        /* Wait for TXE */
+    }
+
+    /* Load data into data register */
+    SPI1->DR = data;
+
+    /* Wait until complete transfer finishes */
+    while (SPI1->SR & 0x0080)
+    {
+        /* Wait for BSY = 0 */
+    }
+}
+
+
+/* ============================================================================
+ * ADC1 INITIALIZATION
+ * ============================================================================
+ *
+ * ADC1 Channel 0 -> PA0
+ *
+ * 12-bit ADC
+ * Software triggered
+ * Single conversion
+ * ========================================================================== */
+
+void ADC1_init(void)
+{
+    /* Enable GPIOA clock */
+    RCC->AHB1ENR |= 0x00000001;
+
+    /* Enable ADC1 clock */
+    RCC->APB2ENR |= 0x00000100;
+
+    /* -----------------------------------------------------------------------
+     * PA0 -> Analog mode
+     * MODER0 = 11
+     * --------------------------------------------------------------------- */
+
+    GPIOA->MODER &= ~0x00000003;
+    GPIOA->MODER |=  0x00000003;
+
+    /* -----------------------------------------------------------------------
+     * ADC configuration
+     * --------------------------------------------------------------------- */
+
+    /* 12-bit resolution */
+    ADC1->CR1 = 0x00000000;
+
+    /* Software trigger */
+    ADC1->CR2 = 0x00000000;
+
+    /* -----------------------------------------------------------------------
+     * Channel 0 sample time
+     *
+     * 100 = 84 ADC cycles
+     * --------------------------------------------------------------------- */
+
+    ADC1->SMPR2 = 0x00000004;
+
+    /* Sequence:
+     * First conversion = Channel 0
+     */
+    ADC1->SQR3 = 0x00000000;
+
+    /* One conversion in regular sequence */
+    ADC1->SQR1 = 0x00000000;
+
+    /* Enable ADC */
+    ADC1->CR2 |= 0x00000001;
+}
+
+
+/* ============================================================================
+ * ADC1 READ
+ * ============================================================================
+ *
+ * Starts one conversion and waits for completion.
+ *
+ * Returns:
+ * 0 to 4095
+ * ========================================================================== */
+
+uint16_t ADC1_read(void)
+{
+    /* Start conversion */
+    ADC1->CR2 |= 0x40000000;
+
+    /* Wait for End Of Conversion */
+    while (!(ADC1->SR & 0x0002))
+    {
+        /* Wait for EOC */
+    }
+
+    /* Read ADC data register */
+    return (uint16_t)(ADC1->DR);
+}
+
+
+/* ============================================================================
+ * USART2 INITIALIZATION
+ * ============================================================================
+ *
+ * USART2_TX -> PA2
+ * USART2_RX -> PA3
+ *
+ * AF7 = USART2
+ *
+ * Baud = 115200
+ * Assuming 16 MHz APB1 clock
+ * ========================================================================== */
+
+void USART2_init(void)
+{
+    /* Enable GPIOA clock */
+    RCC->AHB1ENR |= 0x00000001;
+
+    /* Enable USART2 clock */
+    RCC->APB1ENR |= 0x00020000;
+
+    /* -----------------------------------------------------------------------
+     * PA2 and PA3 -> Alternate Function
+     * --------------------------------------------------------------------- */
+
+    GPIOA->MODER &= ~0x000000F0;
+    GPIOA->MODER |=  0x000000A0;
+
+    /* -----------------------------------------------------------------------
+     * AF7 = USART2
+     *
+     * PA2 AFR[0] bits 11:8
+     * PA3 AFR[0] bits 15:12
+     * --------------------------------------------------------------------- */
+
+    GPIOA->AFR[0] &= ~0x0000FF00;
+    GPIOA->AFR[0] |=  0x00007700;
+
+    /* -----------------------------------------------------------------------
+     * USART configuration
+     *
+     * 16 MHz / 115200 ≈ 138.89
+     * BRR = 0x008B
+     *
+     * 8 data bits
+     * No parity
+     * 1 stop bit
+     * TX enabled
+     * RX enabled
+     * USART enabled
+     * --------------------------------------------------------------------- */
+
+    USART2->BRR = 0x008B;
+
+    USART2->CR1 = 0x00000000;
+
+    /* TE = bit 3
+     * RE = bit 2
+     * UE = bit 13
+     */
+    USART2->CR1 |= 0x0000200C;
+
+    /* 1 stop bit, no special configuration */
+    USART2->CR2 = 0x00000000;
+
+    /* No hardware flow control */
+    USART2->CR3 = 0x00000000;
+}
+
+
+/* ============================================================================
+ * USART2 WRITE CHARACTER
+ * ========================================================================== */
+
+void USART2_write_char(char ch)
+{
+    /* Wait until transmit data register is empty */
+    while (!(USART2->SR & 0x00000080))
+    {
+        /* Wait for TXE */
+    }
+
+    /* Send character */
+    USART2->DR = (uint8_t)ch;
+}
+
+
+/* ============================================================================
+ * USART2 WRITE STRING
+ * ========================================================================== */
+
+void USART2_write_string(const char *str)
+{
+    while (*str)
+    {
+        USART2_write_char(*str);
+        str++;
+    }
+}
+
+
+/* ============================================================================
+ * USART2 WRITE UNSIGNED INTEGER
+ * ============================================================================
+ *
+ * Converts an integer to decimal ASCII and transmits it.
+ * ========================================================================== */
+
+void USART2_write_uint(uint32_t num)
+{
+    char buffer[10];
+    int i = 0;
+
+    /* Special case: zero */
+    if (num == 0)
+    {
+        USART2_write_char('0');
+        return;
+    }
+
+    /* Convert number to ASCII digits */
+    while (num > 0)
+    {
+        buffer[i++] = (char)((num % 10) + '0');
+        num /= 10;
+    }
+
+    /* Send digits in correct order */
+    while (i > 0)
+    {
+        USART2_write_char(buffer[--i]);
+    }
+}
+
+
+/* ============================================================================
+ * DELAY
+ * ============================================================================
+ *
+ * Approximate millisecond delay for 16 MHz HSI.
+ *
+ * This is a simple software delay, suitable for this lab experiment.
+ * ========================================================================== */
+
+void delayMs(int n)
+{
+    int i;
+
+    for (; n > 0; n--)
+    {
+        for (i = 0; i < 3195; i++)
+        {
+            /* Delay */
+        }
+    }
+}
