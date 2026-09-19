@@ -1,0 +1,153 @@
+/**
+ ******************************************************************************
+ * @file    slave.c
+ * @brief   Board 2 - SPI1 Slave + PWM on PB4 (external LED)
+ *
+ *          Receives duty cycle byte from Master via SPI1
+ *          Drives TIM3 Channel 1 PWM on PB4
+ *          PB4 → 220Ω → LED(+) → LED(-) → GND
+ *
+ * Connections from Master:
+ *   Master PA4 → Slave PA4 (SS)
+ *   Master PA5 → Slave PA5 (SCK)
+ *   Master PA7 → Slave PA7 (MOSI)
+ *   Master GND → Slave GND (mandatory)
+ *
+ * LED Connection on Slave:
+ *   PB4 → 220Ω resistor → LED(+) → LED(-) → GND
+ *
+ * PWM:
+ *   Timer     : TIM3 Channel 1
+ *   Pin       : PB4 (AF2 = TIM3_CH1)
+ *   Prescaler : 15  → 1 MHz tick at 16 MHz HSI
+ *   ARR       : 255 → ~3.9 kHz PWM frequency
+ *   CCR1      : 0-255 from received SPI byte
+ *
+ * NUCLEO-F401RE | 16 MHz HSI clock
+ ******************************************************************************
+ */
+
+#include "stm32f4xx.h"
+
+void SPI1_slave_init(void);
+uint8_t SPI1_read(void);
+void TIM3_PWM_init(void);
+void PWM_set_duty(uint8_t duty);
+
+int main(void)
+{
+    uint8_t received = 0;   /* Duty cycle received from master (0-255) */
+
+    SPI1_slave_init();
+    TIM3_PWM_init();
+
+    while (1)
+    {
+        /* Step 1: Wait for Master to pull SS LOW (start of transfer) */
+        while (GPIOA->IDR & 0x0010);    /* Spin while PA4 = HIGH    */
+
+        /* Step 2: Receive duty cycle byte from master */
+        received = SPI1_read();          /* 0 to 255                 */
+
+        /* Step 3: Set LED brightness via PWM
+         *         0   = 0%   duty = LED fully OFF
+         *         128 = 50%  duty = LED half bright
+         *         255 = 100% duty = LED fully ON                   */
+        PWM_set_duty(received);
+
+        /* Step 4: Wait for Master to release SS HIGH (end of transfer) */
+        while (!(GPIOA->IDR & 0x0010)); /* Spin while PA4 = LOW     */
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * Initialize SPI1 as Slave
+ * PA4=SS(input) PA5=SCK(AF5) PA7=MOSI(AF5)
+ * Mode 0, 8-bit, MSB first — must match master exactly
+ * ----------------------------------------------------------------------- */
+void SPI1_slave_init(void)
+{
+    RCC->AHB1ENR  |= 1;              /* Enable GPIOA clock           */
+    RCC->APB2ENR  |= 0x1000;         /* Enable SPI1 clock (bit 12)   */
+
+    /* PA5 (SCK), PA7 (MOSI) → Alternate Function AF5 (SPI1) */
+    GPIOA->MODER  &= ~0x0000CC00;    /* Clear PA5, PA7 mode bits     */
+    GPIOA->MODER  |=  0x00008800;    /* AF mode for PA5, PA7         */
+    GPIOA->AFR[0] &= ~0xF0F00000;    /* Clear AF bits                */
+    GPIOA->AFR[0] |=  0x50500000;    /* AF5 = SPI1 on PA5, PA7       */
+
+    /* PA4 → Input with pull-up (SS from master) */
+    GPIOA->MODER  &= ~0x00000300;    /* Input mode for PA4 (00)      */
+    GPIOA->PUPDR  &= ~0x00000300;    /* Clear pull config            */
+    GPIOA->PUPDR  |=  0x00000100;    /* Pull-up on PA4               */
+
+    /* SPI1 as Slave:
+     * SSM=1, SSI=0 : software mgmt, slave is selected
+     * MSTR=0       : slave mode
+     * CPOL=0,CPHA=0: Mode 0 matches master                         */
+    SPI1->CR1  = 0x0200;             /* SSM=1, SSI=0                 */
+    SPI1->CR2  = 0;
+    SPI1->CR1 |= 0x0040;             /* SPE=1: Enable SPI1           */
+}
+
+/* -----------------------------------------------------------------------
+ * Receive one byte from SPI1 (blocking)
+ * ----------------------------------------------------------------------- */
+uint8_t SPI1_read(void)
+{
+    while (!(SPI1->SR & 1));         /* Wait RXNE=1 (data ready)     */
+    return (uint8_t)(SPI1->DR);      /* Return received byte         */
+}
+
+/* -----------------------------------------------------------------------
+ * Initialize TIM3 Channel 1 PWM on PB4 (external LED)
+ * PB4 uses AF2 for TIM3_CH1
+ * PSC=15 → 1MHz tick | ARR=255 → ~3.9kHz PWM
+ * ----------------------------------------------------------------------- */
+void TIM3_PWM_init(void)
+{
+    RCC->AHB1ENR  |= 2;              /* Enable GPIOB clock (bit 1)   */
+    RCC->APB1ENR  |= 0x00000002;     /* Enable TIM3 clock (bit 1)    */
+
+    /* PB4 → Alternate Function AF2 (TIM3_CH1) */
+    GPIOB->MODER  &= ~0x00000300;    /* Clear PB4 mode bits          */
+    GPIOB->MODER  |=  0x00000200;    /* AF mode for PB4              */
+    GPIOB->AFR[0] &= ~0x000F0000;    /* Clear AF bits for PB4        */
+    GPIOB->AFR[0] |=  0x00020000;    /* AF2 = TIM3_CH1 on PB4        */
+
+    /* Timer configuration:
+     * PSC = 15  → 16MHz / 16 = 1MHz timer tick
+     * ARR = 255 → period = 256 ticks = ~3.9kHz PWM                 */
+    TIM3->PSC  = 15;                 /* Prescaler                    */
+    TIM3->ARR  = 255;                /* Auto-reload (sets period)    */
+    TIM3->CCR1 = 0;                  /* Start at 0% duty (LED off)   */
+
+    /* PWM Mode 1 on CH1:
+     * OC1M  = 110 : HIGH while CNT < CCR1, LOW when CNT >= CCR1
+     * OC1PE = 1   : preload enable (updates on next UEV)           */
+    TIM3->CCMR1 &= ~0x0073;          /* Clear OC1M and OC1PE         */
+    TIM3->CCMR1 |=  0x0060;          /* OC1M = PWM mode 1            */
+    TIM3->CCMR1 |=  0x0008;          /* OC1PE = preload enable        */
+
+    /* Enable CH1 output */
+    TIM3->CCER  |=  0x0001;          /* CC1E = 1                     */
+
+    /* Enable auto-reload preload */
+    TIM3->CR1   |=  0x0080;          /* ARPE = 1                     */
+
+    /* Load PSC and ARR into shadow registers immediately */
+    TIM3->EGR   |=  0x0001;          /* UG = 1: update event         */
+
+    /* Start TIM3 */
+    TIM3->CR1   |=  0x0001;          /* CEN = 1: start counter       */
+}
+
+/* -----------------------------------------------------------------------
+ * Set PWM duty cycle on TIM3 CH1 → controls LED brightness
+ * duty = 0   → LED OFF
+ * duty = 255 → LED fully ON
+ * ----------------------------------------------------------------------- */
+void PWM_set_duty(uint8_t duty)
+{
+    TIM3->CCR1 = duty;               /* Update compare value         */
+}
